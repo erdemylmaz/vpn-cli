@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# vpn — openvpn wrapper for ~/.vpn/client.ovpn
+set -euo pipefail
+
+VPN_DIR="${VPN_DIR:-$HOME/.vpn}"
+CONFIG="${VPN_CONFIG:-$VPN_DIR/client.ovpn}"
+PIDFILE="$VPN_DIR/openvpn.pid"
+LOGFILE="$VPN_DIR/openvpn.log"
+OPENVPN_BIN="${OPENVPN_BIN:-/opt/homebrew/sbin/openvpn}"
+
+mkdir -p "$VPN_DIR"
+
+is_running() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  [[ -n "$pid" ]] || return 1
+  # ps -p works regardless of process owner; kill -0 fails for root-owned procs from a normal user
+  ps -p "$pid" >/dev/null 2>&1
+}
+
+require_config() {
+  if [[ ! -f "$CONFIG" ]]; then
+    echo "error: config not found at $CONFIG" >&2
+    exit 1
+  fi
+}
+
+require_bin() {
+  if [[ ! -x "$OPENVPN_BIN" ]]; then
+    echo "error: openvpn binary not found at $OPENVPN_BIN" >&2
+    echo "install with: brew install openvpn" >&2
+    exit 1
+  fi
+}
+
+cmd_start() {
+  require_bin
+  require_config
+  if is_running; then
+    echo "already running (pid $(cat "$PIDFILE"))"
+    return 0
+  fi
+  rm -f "$PIDFILE"
+  echo "starting vpn (sudo password may be required)…"
+  sudo "$OPENVPN_BIN" \
+    --config "$CONFIG" \
+    --cd "$VPN_DIR" \
+    --daemon openvpn-vpnwrap \
+    --writepid "$PIDFILE" \
+    --log "$LOGFILE" \
+    --verb 3
+  # wait briefly for daemon to come up
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.5
+    is_running && break
+  done
+  if is_running; then
+    echo "started (pid $(cat "$PIDFILE")) — logs: $LOGFILE"
+  else
+    echo "failed to start; tail of log:" >&2
+    sudo tail -n 30 "$LOGFILE" >&2 || true
+    return 1
+  fi
+}
+
+cmd_stop() {
+  if ! is_running; then
+    echo "not running"
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  local pid; pid=$(cat "$PIDFILE")
+  echo "stopping (pid $pid)…"
+  if ! sudo kill "$pid"; then
+    echo "error: sudo kill failed" >&2
+    return 1
+  fi
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    is_running || break
+  done
+  if is_running; then
+    echo "still alive, sending SIGKILL…"
+    if ! sudo kill -9 "$pid"; then
+      echo "error: sudo kill -9 failed" >&2
+      return 1
+    fi
+    sleep 0.5
+  fi
+  if is_running; then
+    echo "error: process $pid still alive after SIGKILL" >&2
+    return 1
+  fi
+  rm -f "$PIDFILE"
+  echo "stopped"
+}
+
+cmd_restart() {
+  cmd_stop || true
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  if is_running; then
+    local pid up
+    pid=$(cat "$PIDFILE")
+    up=$(ps -o etime= -p "$pid" 2>/dev/null | awk '{$1=$1;print}')
+    echo "vpn: RUNNING  pid=$pid  uptime=${up:-?}"
+  else
+    echo "vpn: STOPPED"
+  fi
+}
+
+cmd_info() {
+  cmd_status
+  echo
+  local remote
+  remote=$(grep -E '^remote ' "$CONFIG" 2>/dev/null | head -1 | awk '{print $2":"$3}')
+  echo "config:  $CONFIG"
+  echo "remote:  ${remote:-?}"
+  echo "logs:    $LOGFILE"
+  echo "pidfile: $PIDFILE"
+  if is_running; then
+    echo
+    echo "tunnel interfaces:"
+    ifconfig 2>/dev/null | awk '
+      /^utun[0-9]+:/ { iface=$1; sub(":","",iface); have_inet=0 }
+      /^[a-z]/ && !/^utun/ { iface="" }
+      iface && /inet / && $2 !~ /^fe80/ { print "  " iface "  " $2 "  peer " $4 }
+    '
+    echo
+    echo "default route:"
+    netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print "  via "$2"  dev "$NF; exit}'
+    echo
+    echo "public ip:"
+    local ip
+    ip=$(curl -s --max-time 5 https://api.ipify.org || true)
+    echo "  ${ip:-(unreachable)}"
+  fi
+}
+
+cmd_logs() {
+  if [[ ! -f "$LOGFILE" ]]; then
+    echo "no log at $LOGFILE"
+    return 1
+  fi
+  if [[ "${1:-}" == "-f" || "${1:-}" == "tail" ]]; then
+    sudo tail -f "$LOGFILE"
+  else
+    sudo tail -n "${1:-50}" "$LOGFILE"
+  fi
+}
+
+cmd_config() {
+  case "${1:-path}" in
+    path) echo "$CONFIG" ;;
+    edit) "${EDITOR:-vi}" "$CONFIG" ;;
+    show) cat "$CONFIG" ;;
+    *) echo "usage: vpn config [path|edit|show]" >&2; return 1 ;;
+  esac
+}
+
+cmd_help() {
+  cat <<EOF
+vpn — openvpn wrapper
+
+usage:
+  vpn start            start vpn in background (asks sudo)
+  vpn stop             stop vpn
+  vpn restart          stop + start
+  vpn status           running state, pid, uptime
+  vpn info             status + tunnel ip + public ip + config
+  vpn logs [N]         show last N lines (default 50)
+  vpn logs -f          follow logs
+  vpn config [cmd]     path|edit|show
+  vpn help             this help
+
+paths:
+  config:  $CONFIG
+  pidfile: $PIDFILE
+  logs:    $LOGFILE
+  binary:  $OPENVPN_BIN
+
+env overrides: VPN_DIR, VPN_CONFIG, OPENVPN_BIN
+EOF
+}
+
+case "${1:-help}" in
+  start)               shift; cmd_start "$@" ;;
+  stop|down)           shift; cmd_stop "$@" ;;
+  restart|reload)      shift; cmd_restart "$@" ;;
+  status|st)           shift; cmd_status "$@" ;;
+  info|ip)             shift; cmd_info "$@" ;;
+  logs|log|tail)       shift; cmd_logs "$@" ;;
+  config|conf)         shift; cmd_config "$@" ;;
+  help|-h|--help|"")   cmd_help ;;
+  *) echo "unknown command: $1" >&2; cmd_help; exit 1 ;;
+esac

@@ -1,0 +1,8 @@
+.DS_Store
+
+# never commit any VPN credentials, just in case
+*.ovpn
+*.pem
+*.key
+*.crt
+client.*
