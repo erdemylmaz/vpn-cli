@@ -25,10 +25,10 @@ if [[ ! -x "$OPENVPN_BIN" ]]; then
   brew install openvpn
 fi
 
-# 2. ~/.vpn/
-say "creating $VPN_DIR"
-mkdir -p "$VPN_DIR"
-chmod 700 "$VPN_DIR"
+# 2. ~/.vpn/ and ~/.vpn/profiles/
+say "creating $VPN_DIR and $VPN_DIR/profiles"
+mkdir -p "$VPN_DIR/profiles"
+chmod 700 "$VPN_DIR" "$VPN_DIR/profiles"
 
 # 3. symlink ~/.local/bin/vpn -> repo
 mkdir -p "$BIN_DIR"
@@ -76,14 +76,20 @@ else
   echo "    ./install.sh --sudoers"
 fi
 
-# 6. config check
+# 6. profile check
 echo
-if [[ ! -f "$VPN_DIR/client.ovpn" ]]; then
-  warn "no config found at $VPN_DIR/client.ovpn"
-  echo "    copy your OpenVPN client config there and chmod 600 it:"
-  echo "    cp /path/to/client.ovpn $VPN_DIR/client.ovpn && chmod 600 $VPN_DIR/client.ovpn"
+shopt -s nullglob
+profiles=( "$VPN_DIR"/profiles/*.ovpn )
+shopt -u nullglob
+if (( ${#profiles[@]} == 0 )) && [[ ! -f "$VPN_DIR/client.ovpn" ]]; then
+  warn "no profiles found in $VPN_DIR/profiles/"
+  echo "    drop your OpenVPN client config(s) there, named <profile>.ovpn:"
+  echo "      cp /path/to/foo.ovpn $VPN_DIR/profiles/foo.ovpn && chmod 600 $VPN_DIR/profiles/foo.ovpn"
+  echo "      vpn use foo"
+elif (( ${#profiles[@]} > 0 )); then
+  say "found ${#profiles[@]} profile(s) in $VPN_DIR/profiles/"
 else
-  say "config found at $VPN_DIR/client.ovpn"
+  say "legacy config detected at $VPN_DIR/client.ovpn (will be used as fallback)"
 fi
 
 echo

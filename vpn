@@ -1,14 +1,56 @@
 #!/usr/bin/env bash
-# vpn — openvpn wrapper for ~/.vpn/client.ovpn
+# vpn — openvpn wrapper with multi-profile support
+#   profiles live at ~/.vpn/profiles/<name>.ovpn
+#   the default profile is recorded in ~/.vpn/active (override per-invocation with the positional arg or VPN_PROFILE)
+#   only one tunnel runs at a time — the running profile is tracked in ~/.vpn/active.run
 set -euo pipefail
 
 VPN_DIR="${VPN_DIR:-$HOME/.vpn}"
-CONFIG="${VPN_CONFIG:-$VPN_DIR/client.ovpn}"
+PROFILES_DIR="$VPN_DIR/profiles"
+ACTIVE_FILE="$VPN_DIR/active"
+RUN_PROFILE_FILE="$VPN_DIR/active.run"
+LEGACY_CONFIG="$VPN_DIR/client.ovpn"
 PIDFILE="$VPN_DIR/openvpn.pid"
 LOGFILE="$VPN_DIR/openvpn.log"
 OPENVPN_BIN="${OPENVPN_BIN:-/opt/homebrew/sbin/openvpn}"
 
-mkdir -p "$VPN_DIR"
+mkdir -p "$VPN_DIR" "$PROFILES_DIR"
+
+# --- profile resolution -----------------------------------------------------
+
+# Resolve which profile to use. Priority: arg > $VPN_PROFILE > $ACTIVE_FILE > legacy.
+# Echoes the profile name. Empty if none found. Special token "__legacy__" means use $LEGACY_CONFIG.
+resolve_profile() {
+  local name="${1:-${VPN_PROFILE:-}}"
+  if [[ -z "$name" && -f "$ACTIVE_FILE" ]]; then
+    name=$(tr -d '[:space:]' < "$ACTIVE_FILE" 2>/dev/null || true)
+  fi
+  if [[ -z "$name" ]]; then
+    if [[ -f "$LEGACY_CONFIG" ]]; then
+      echo "__legacy__"
+    else
+      echo ""
+    fi
+    return
+  fi
+  echo "$name"
+}
+
+config_for_profile() {
+  local name="$1"
+  if [[ "$name" == "__legacy__" ]]; then
+    echo "$LEGACY_CONFIG"
+  else
+    echo "$PROFILES_DIR/$name.ovpn"
+  fi
+}
+
+display_profile() {
+  local name="$1"
+  [[ "$name" == "__legacy__" ]] && echo "(legacy)" || echo "$name"
+}
+
+# --- state ------------------------------------------------------------------
 
 is_running() {
   [[ -f "$PIDFILE" ]] || return 1
@@ -19,10 +61,15 @@ is_running() {
   ps -p "$pid" >/dev/null 2>&1
 }
 
+running_profile() {
+  [[ -f "$RUN_PROFILE_FILE" ]] && cat "$RUN_PROFILE_FILE" 2>/dev/null || echo ""
+}
+
 require_config() {
-  if [[ ! -f "$CONFIG" ]]; then
-    echo "error: config not found at $CONFIG" >&2
-    exit 1
+  local cfg="$1"
+  if [[ ! -f "$cfg" ]]; then
+    echo "error: config not found at $cfg" >&2
+    return 1
   fi
 }
 
@@ -30,21 +77,38 @@ require_bin() {
   if [[ ! -x "$OPENVPN_BIN" ]]; then
     echo "error: openvpn binary not found at $OPENVPN_BIN" >&2
     echo "install with: brew install openvpn" >&2
-    exit 1
+    return 1
   fi
 }
 
+# --- commands ---------------------------------------------------------------
+
 cmd_start() {
   require_bin
-  require_config
+  local profile
+  profile=$(resolve_profile "${1:-}")
+  if [[ -z "$profile" ]]; then
+    echo "error: no profile specified and no default set." >&2
+    echo "  drop a config at $PROFILES_DIR/<name>.ovpn, then:" >&2
+    echo "    vpn use <name>   # set default" >&2
+    echo "    vpn start <name> # one-shot" >&2
+    return 1
+  fi
+  local cfg
+  cfg=$(config_for_profile "$profile")
+  require_config "$cfg" || return 1
   if is_running; then
-    echo "already running (pid $(cat "$PIDFILE"))"
+    local cur; cur=$(running_profile)
+    echo "already running (pid $(cat "$PIDFILE"), profile: ${cur:-?})"
+    if [[ -n "$cur" && "$cur" != "$profile" ]]; then
+      echo "  to switch: vpn stop && vpn start $profile" >&2
+    fi
     return 0
   fi
-  rm -f "$PIDFILE"
-  echo "starting vpn (sudo password may be required)…"
+  rm -f "$PIDFILE" "$RUN_PROFILE_FILE"
+  echo "starting vpn [profile: $(display_profile "$profile")] (sudo password may be required)…"
   sudo "$OPENVPN_BIN" \
-    --config "$CONFIG" \
+    --config "$cfg" \
     --cd "$VPN_DIR" \
     --daemon openvpn-vpnwrap \
     --writepid "$PIDFILE" \
@@ -56,7 +120,8 @@ cmd_start() {
     is_running && break
   done
   if is_running; then
-    echo "started (pid $(cat "$PIDFILE")) — logs: $LOGFILE"
+    echo "$profile" > "$RUN_PROFILE_FILE"
+    echo "started (pid $(cat "$PIDFILE"), profile: $(display_profile "$profile")) — logs: $LOGFILE"
   else
     echo "failed to start; tail of log:" >&2
     sudo tail -n 30 "$LOGFILE" >&2 || true
@@ -67,7 +132,7 @@ cmd_start() {
 cmd_stop() {
   if ! is_running; then
     echo "not running"
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$RUN_PROFILE_FILE"
     return 0
   fi
   local pid; pid=$(cat "$PIDFILE")
@@ -92,22 +157,28 @@ cmd_stop() {
     echo "error: process $pid still alive after SIGKILL" >&2
     return 1
   fi
-  rm -f "$PIDFILE"
+  rm -f "$PIDFILE" "$RUN_PROFILE_FILE"
   echo "stopped"
 }
 
 cmd_restart() {
+  local target_profile="${1:-}"
+  # if no profile was given, restart the currently running one (or fall back to default)
+  if [[ -z "$target_profile" ]]; then
+    target_profile=$(running_profile || true)
+  fi
   cmd_stop || true
   sleep 1
-  cmd_start
+  cmd_start "$target_profile"
 }
 
 cmd_status() {
   if is_running; then
-    local pid up
+    local pid up cur
     pid=$(cat "$PIDFILE")
     up=$(ps -o etime= -p "$pid" 2>/dev/null | awk '{$1=$1;print}')
-    echo "vpn: RUNNING  pid=$pid  uptime=${up:-?}"
+    cur=$(running_profile)
+    echo "vpn: RUNNING  pid=$pid  uptime=${up:-?}  profile=${cur:-?}"
   else
     echo "vpn: STOPPED"
   fi
@@ -116,10 +187,23 @@ cmd_status() {
 cmd_info() {
   cmd_status
   echo
-  local remote
-  remote=$(grep -E '^remote ' "$CONFIG" 2>/dev/null | head -1 | awk '{print $2":"$3}')
-  echo "config:  $CONFIG"
-  echo "remote:  ${remote:-?}"
+  local cur; cur=$(running_profile)
+  local profile cfg
+  if is_running && [[ -n "$cur" ]]; then
+    profile="$cur"
+  else
+    profile=$(resolve_profile)
+  fi
+  if [[ -n "$profile" ]]; then
+    cfg=$(config_for_profile "$profile")
+    local remote
+    remote=$(grep -E '^remote ' "$cfg" 2>/dev/null | head -1 | awk '{print $2":"$3}')
+    echo "profile: $(display_profile "$profile")"
+    echo "config:  $cfg"
+    echo "remote:  ${remote:-?}"
+  else
+    echo "profile: (none)"
+  fi
   echo "logs:    $LOGFILE"
   echo "pidfile: $PIDFILE"
   if is_running; then
@@ -155,35 +239,101 @@ cmd_logs() {
 
 cmd_config() {
   case "${1:-path}" in
-    path) echo "$CONFIG" ;;
-    edit) "${EDITOR:-vi}" "$CONFIG" ;;
-    show) cat "$CONFIG" ;;
-    *) echo "usage: vpn config [path|edit|show]" >&2; return 1 ;;
+    path)
+      local profile cfg
+      profile=$(resolve_profile "${2:-}")
+      if [[ -z "$profile" ]]; then echo "(no profile)"; return 1; fi
+      config_for_profile "$profile"
+      ;;
+    edit)
+      local profile cfg
+      profile=$(resolve_profile "${2:-}")
+      if [[ -z "$profile" ]]; then echo "error: no profile"; return 1; fi
+      cfg=$(config_for_profile "$profile")
+      "${EDITOR:-vi}" "$cfg"
+      ;;
+    show)
+      local profile cfg
+      profile=$(resolve_profile "${2:-}")
+      if [[ -z "$profile" ]]; then echo "error: no profile"; return 1; fi
+      cfg=$(config_for_profile "$profile")
+      cat "$cfg"
+      ;;
+    *) echo "usage: vpn config [path|edit|show] [profile]" >&2; return 1 ;;
   esac
+}
+
+cmd_list() {
+  local active=""
+  [[ -f "$ACTIVE_FILE" ]] && active=$(tr -d '[:space:]' < "$ACTIVE_FILE" 2>/dev/null || true)
+  local cur; cur=$(running_profile)
+  local found=0
+  shopt -s nullglob
+  for f in "$PROFILES_DIR"/*.ovpn; do
+    found=1
+    local name; name=$(basename "$f" .ovpn)
+    local marks=""
+    [[ "$name" == "$active" ]] && marks+="*"
+    [[ "$name" == "$cur" ]] && marks+="↑"
+    printf "  %-2s %s\n" "${marks:-}" "$name"
+  done
+  shopt -u nullglob
+  if [[ -f "$LEGACY_CONFIG" ]]; then
+    found=1
+    local marks=""
+    [[ -z "$active" ]] && marks+="*"
+    [[ "$cur" == "__legacy__" ]] && marks+="↑"
+    printf "  %-2s %s\n" "${marks:-}" "(legacy: $LEGACY_CONFIG)"
+  fi
+  if (( ! found )); then
+    echo "no profiles. drop a config at $PROFILES_DIR/<name>.ovpn"
+    return 1
+  fi
+  echo
+  echo "  * = default   ↑ = currently running"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: vpn use <profile>" >&2
+    return 1
+  fi
+  local cfg="$PROFILES_DIR/$name.ovpn"
+  if [[ ! -f "$cfg" ]]; then
+    echo "error: no profile '$name' at $cfg" >&2
+    return 1
+  fi
+  echo "$name" > "$ACTIVE_FILE"
+  echo "default profile set to: $name"
 }
 
 cmd_help() {
   cat <<EOF
-vpn — openvpn wrapper
+vpn — openvpn wrapper with multi-profile support
 
 usage:
-  vpn start            start vpn in background (asks sudo)
-  vpn stop             stop vpn
-  vpn restart          stop + start
-  vpn status           running state, pid, uptime
-  vpn info             status + tunnel ip + public ip + config
-  vpn logs [N]         show last N lines (default 50)
-  vpn logs -f          follow logs
-  vpn config [cmd]     path|edit|show
-  vpn help             this help
+  vpn start [profile]   start vpn (default profile if omitted)
+  vpn stop              stop vpn
+  vpn restart [profile] stop + start
+  vpn status            running state, pid, uptime, profile
+  vpn info              status + tunnel ip + public ip + config
+  vpn list              list available profiles (* default, ↑ running)
+  vpn use <profile>     set the default profile
+  vpn logs [N|-f]       last N lines (default 50), or follow
+  vpn config [cmd] [p]  path|edit|show, optional profile
+  vpn help              this help
+
+profiles:
+  drop client .ovpn files at: $PROFILES_DIR/<name>.ovpn
+  current default:            $( [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE" || echo "(none — legacy fallback if $LEGACY_CONFIG exists)" )
 
 paths:
-  config:  $CONFIG
-  pidfile: $PIDFILE
-  logs:    $LOGFILE
-  binary:  $OPENVPN_BIN
+  pidfile:  $PIDFILE
+  logs:     $LOGFILE
+  binary:   $OPENVPN_BIN
 
-env overrides: VPN_DIR, VPN_CONFIG, OPENVPN_BIN
+env overrides: VPN_DIR, VPN_PROFILE, OPENVPN_BIN
 EOF
 }
 
@@ -193,6 +343,8 @@ case "${1:-help}" in
   restart|reload)      shift; cmd_restart "$@" ;;
   status|st)           shift; cmd_status "$@" ;;
   info|ip)             shift; cmd_info "$@" ;;
+  list|ls|profiles)    shift; cmd_list "$@" ;;
+  use|default)         shift; cmd_use "$@" ;;
   logs|log|tail)       shift; cmd_logs "$@" ;;
   config|conf)         shift; cmd_config "$@" ;;
   help|-h|--help|"")   cmd_help ;;
