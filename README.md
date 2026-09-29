@@ -115,7 +115,7 @@ This CLI is the client side. To actually have something to connect to, you (or y
 ### Naming convention
 
 - **Server-side cert name** identifies a *device*, picked when you add a user. Convention: `<person>-<device>` — e.g. `erdem-laptop`, `erdem-desktop`, `ahmet-laptop`. This is what shows up in the server's revoke menu.
-- **Local-side profile name** is the `.ovpn` filename on the user's laptop. Convention: name it after the *server you're connecting to* — e.g. `actual-development.ovpn` so `vpn start actual-development` works regardless of whose laptop you're on.
+- **Local-side profile name** is the `.ovpn` filename on the user's laptop. Convention: name it after the *server you're connecting to* — e.g. `my-server.ovpn` so `vpn start my-server` works regardless of whose laptop you're on.
 
 The cert *inside* the file is per-device; the *filename* on disk is per-server.
 
@@ -202,11 +202,11 @@ cd ~/Documents/personal/vpn
 
 # drop in the config (received securely; rename to the *server* name, not their cert name)
 mkdir -p ~/.vpn/profiles
-mv ~/Downloads/ahmet-laptop.ovpn ~/.vpn/profiles/actual-development.ovpn
-chmod 600 ~/.vpn/profiles/actual-development.ovpn
+mv ~/Downloads/ahmet-laptop.ovpn ~/.vpn/profiles/my-server.ovpn
+chmod 600 ~/.vpn/profiles/my-server.ovpn
 
 # set default and connect
-vpn use actual-development
+vpn use my-server
 vpn start
 vpn info   # "public ip:" should now be the dev server's public IP
 ```
